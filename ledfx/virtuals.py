@@ -12,7 +12,7 @@ import zeroconf
 
 from ledfx.color import parse_color
 from ledfx.effects import DummyEffect
-from ledfx.effects.math import interpolate_pixels
+from ledfx.effects.math import interpolate_pixels, make_pattern
 from ledfx.effects.melbank import (
     MAX_FREQ,
     MIN_FREQ,
@@ -151,7 +151,8 @@ class Virtual:
         self._hl_device = None
         self._hl_start = 0
         self._hl_end = 0
-        self._hl_flip = False
+        self._hl_step = 1
+        self._os_active = False
         self.lock = threading.Lock()
 
         self.frequency_range = FrequencyRange(
@@ -232,8 +233,6 @@ class Virtual:
 
     def update_segments(self, segments_config):
         self.lock.acquire()
-        if self._active_effect is not None:
-            self._active_effect.lock.acquire()
         segments_config = [list(item) for item in segments_config]
         _segments = self.SEGMENTS_SCHEMA(segments_config)
 
@@ -271,8 +270,7 @@ class Virtual:
 
             mode = self._config["transition_mode"]
             self.frame_transitions = self.transitions[mode]
-        if self._active_effect is not None:
-            self._active_effect.lock.release()
+
         self.lock.release()
 
     def set_preset(self, preset_info):
@@ -391,10 +389,53 @@ class Virtual:
             VirtualUpdateEvent(self.id, self.assembled_frame)
         )
 
+    def oneshot(self, color, ramp, hold, fade):
+        """
+        Force all pixels in virtual to color over a time envelope defined in ms
+        Following calls will override any active one shot
+
+        Parameters:
+            ramp time from 0% to 100% in ms
+            hold time at 100% in ms
+            fade time from 100% to 0% in ms
+        Returns:
+            True if oneshot was activated, False if not
+        """
+        if self.active:
+            self._os_color = np.array(color, dtype=float)
+            self._os_ramp = ramp / 1000.0
+            self._os_hold = hold / 1000.0
+            self._os_fade = fade / 1000.0
+            self._os_start = timeit.default_timer()
+            self._os_hold_end = self._os_ramp + self._os_hold
+            self._os_fade_end = self._os_ramp + self._os_hold + self._os_fade
+            self._os_weight = 0.0
+            self._os_active = True
+            result = True
+        else:
+            result = False
+        return result
+
+    def oneshot_weight(self):
+        passed = timeit.default_timer() - self._os_start
+        if passed <= self._os_ramp:
+            self._os_weight = passed / self._os_ramp
+        elif passed <= self._os_hold_end:
+            self._os_weight = 1.0
+        elif passed <= self._os_fade_end:
+            self._os_weight = (self._os_fade_end - passed) / self._os_fade
+        else:
+            self._os_active = False
+            self._os_weight = 0.0
+        # _LOGGER.info(f"oneshot_state: {passed} {self._os_ramp} {self._os_hold_end} {self._os_fade_end} {self._os_active} {self._os_weight}")
+
+    def oneshot_apply(self, seg):
+        blend = np.multiply(self._os_color, self._os_weight)
+        np.multiply(seg, 1 - self._os_weight, seg)
+        np.add(seg, blend, seg)
+
     def set_calibration(self, calibration):
         self._calibration = calibration
-        if calibration is False:
-            self._hl_segment = -1
 
     def set_highlight(self, state, device_id, start, end, flip):
         if self._calibration is False:
@@ -415,7 +456,10 @@ class Virtual:
         self._hl_device = device_id
         self._hl_start = start
         self._hl_end = end
-        self._hl_flip = flip
+        if flip:
+            self._hl_step = -1
+        else:
+            self._hl_step = 1
         return None
 
     @property
@@ -471,51 +515,53 @@ class Virtual:
         # Get and process active effect frame
         self._active_effect._render()
         frame = self._active_effect.get_pixels()
-        if frame is None:
-            return
-        frame[frame > 255] = 255
-        frame[frame < 0] = 0
-        # np.clip(frame, 0, 255, frame)
-
-        if self._config["center_offset"]:
-            frame = np.roll(frame, self._config["center_offset"], axis=0)
-
-        # This part handles blending two effects together
-        if (
-            self._transition_effect is not None
-            and self._transition_effect.is_active
-            and hasattr(self._transition_effect, "pixels")
-        ):
-            # Get and process transition effect frame
-            self._transition_effect._render()
-            transition_frame = self._transition_effect.get_pixels()
-            transition_frame[transition_frame > 255] = 255
-            transition_frame[transition_frame < 0] = 0
+        if frame is not None:
+            frame[frame > 255] = 255
+            frame[frame < 0] = 0
+            # np.clip(frame, 0, 255, frame)
 
             if self._config["center_offset"]:
-                transition_frame = np.roll(
-                    transition_frame,
-                    self._config["center_offset"],
-                    axis=0,
+                frame = np.roll(frame, self._config["center_offset"], axis=0)
+
+            # This part handles blending two effects together
+            if (
+                self._transition_effect is not None
+                and self._transition_effect.is_active
+                and hasattr(self._transition_effect, "pixels")
+            ):
+                # Get and process transition effect frame
+                self._transition_effect._render()
+                transition_frame = self._transition_effect.get_pixels()
+                transition_frame[transition_frame > 255] = 255
+                transition_frame[transition_frame < 0] = 0
+
+                if self._config["center_offset"]:
+                    transition_frame = np.roll(
+                        transition_frame,
+                        self._config["center_offset"],
+                        axis=0,
+                    )
+
+                # Blend both frames together
+                self.transition_frame_counter += 1
+                self.transition_frame_counter = min(
+                    max(self.transition_frame_counter, 0),
+                    self.transition_frame_total,
                 )
+                weight = (
+                    self.transition_frame_counter / self.transition_frame_total
+                )
+                self.frame_transitions(
+                    self.transitions, frame, transition_frame, weight
+                )
+                if (
+                    self.transition_frame_counter
+                    == self.transition_frame_total
+                ):
+                    self.clear_transition_effect()
 
-            # Blend both frames together
-            self.transition_frame_counter += 1
-            self.transition_frame_counter = min(
-                max(self.transition_frame_counter, 0),
-                self.transition_frame_total,
-            )
-            weight = (
-                self.transition_frame_counter / self.transition_frame_total
-            )
-            self.frame_transitions(
-                self.transitions, frame, transition_frame, weight
-            )
-            if self.transition_frame_counter == self.transition_frame_total:
-                self.clear_transition_effect()
-
-        np.multiply(frame, self._config["max_brightness"], frame)
-        np.multiply(frame, self._ledfx.config["global_brightness"], frame)
+            np.multiply(frame, self._config["max_brightness"], frame)
+            np.multiply(frame, self._ledfx.config["global_brightness"], frame)
         self.lock.release()
         return frame
 
@@ -541,6 +587,7 @@ class Virtual:
             except ValueError as e:
                 _LOGGER.error(e)
             self._active = True
+            self._os_active = False
 
         # self.thread_function()
 
@@ -552,6 +599,7 @@ class Virtual:
 
     def deactivate(self):
         self._active = False
+        self._os_active = False
         if hasattr(self, "_thread"):
             self._thread.join()
         self.deactivate_segments()
@@ -586,8 +634,10 @@ class Virtual:
         if pixels is None:
             pixels = self.assembled_frame
 
+        if self._os_active:
+            self.oneshot_weight()
+
         color_cycle = itertools.cycle(color_list)
-        hl_segment = 0
 
         for device_id, segments in self._segments_by_device.items():
             data = []
@@ -595,31 +645,9 @@ class Virtual:
             if device is not None:
                 if device.is_active():
                     if self._calibration:
-                        # set data to black for full length of led strip allow other segments to overwrite
-                        data.append(
-                            (
-                                np.array([0.0, 0.0, 0.0], dtype=float),
-                                0,
-                                device.pixel_count - 1,
-                            )
+                        self.render_calibration(
+                            data, device, segments, device_id, color_cycle
                         )
-
-                        for (
-                            start,
-                            stop,
-                            step,
-                            device_start,
-                            device_end,
-                        ) in segments:
-                            # add data forced to color sequence of RGBCMY
-                            color = np.array(
-                                parse_color(next(color_cycle)), dtype=float
-                            )
-
-                            data.append((color, device_start, device_end))
-                        if self._hl_state and device_id == self._hl_device:
-                            color = np.array(parse_color("white"), dtype=float)
-                            data.append((color, self._hl_start, self._hl_end))
                     elif self._config["mapping"] == "span":
                         for (
                             start,
@@ -628,13 +656,10 @@ class Virtual:
                             device_start,
                             device_end,
                         ) in segments:
-                            data.append(
-                                (
-                                    pixels[start:stop:step],
-                                    device_start,
-                                    device_end,
-                                )
-                            )
+                            seg = pixels[start:stop:step]
+                            if self._os_active:
+                                self.oneshot_apply(seg)
+                            data.append((seg, device_start, device_end))
                     elif self._config["mapping"] == "copy":
                         for (
                             start,
@@ -644,16 +669,44 @@ class Virtual:
                             device_end,
                         ) in segments:
                             target_len = device_end - device_start + 1
-                            data.append(
-                                (
-                                    interpolate_pixels(pixels, target_len)[
-                                        ::step
-                                    ],
-                                    device_start,
-                                    device_end,
-                                )
-                            )
+                            seg = interpolate_pixels(pixels, target_len)[
+                                ::step
+                            ]
+                            if self._os_active:
+                                self.oneshot_apply(seg)
+                            data.append((seg, device_start, device_end))
                     device.update_pixels(self.id, data)
+
+    def render_calibration(
+        self, data, device, segments, device_id, color_cycle
+    ):
+        """
+        Renders the calibration data to the virtual output
+        """
+
+        # set data to black for full length of led strip allow other segments to overwrite
+        data.append(
+            (
+                np.array([0.0, 0.0, 0.0], dtype=float),
+                0,
+                device.pixel_count - 1,
+            )
+        )
+
+        for start, stop, step, device_start, device_end in segments:
+            # add data forced to color sequence of RGBCMY
+            color = np.array(parse_color(next(color_cycle)), dtype=float)
+            pattern = make_pattern(color, device_end - device_start + 1, step)
+            data.append((pattern, device_start, device_end))
+        # render the highlight
+        if self._hl_state and device_id == self._hl_device:
+            color = np.array(parse_color("white"), dtype=float)
+            pattern = make_pattern(
+                color,
+                self._hl_end - self._hl_start + 1,
+                self._hl_step,
+            )
+            data.append((pattern, self._hl_start, self._hl_end))
 
     @property
     def name(self):

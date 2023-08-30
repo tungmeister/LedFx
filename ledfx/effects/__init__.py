@@ -22,18 +22,26 @@ class DummyEffect:
 
     def __init__(self, pixel_count):
         self.pixels = np.zeros((pixel_count, 3))
+        self.pixel_count = pixel_count
 
     def _render(self):
-        pass
+        # we don't need a self.lock as we don't do anything in deactivate
+        # self.pixels will be valid while this instance is in scope
+        self.render()
 
     def render(self):
-        pass
+        # we need to clear this each render frame as transitions reuse
+        # active effect pixel space
+        self.pixels = np.zeros((self.pixel_count, 3))
 
     def get_pixels(self):
         return self.pixels
 
     def activate(self):
         pass
+
+    def _deactivate(self):
+        self.deactivate()
 
     def deactivate(self):
         pass
@@ -251,7 +259,7 @@ class Effect(BaseRegistry):
 
     def __del__(self):
         if self._active:
-            self.deactivate()
+            self._deactivate()
 
     def activate(self, virtual):
         self.lock.acquire()
@@ -270,12 +278,17 @@ class Effect(BaseRegistry):
         self.lock.release()
         _LOGGER.info(f"Effect {self.NAME} activated.")
 
-    def deactivate(self):
+    def _deactivate(self):
+        # we need this wrapper to ensure the full chain of
+        # deactivation is protected
         self.lock.acquire()
+        self.deactivate()
+        self.lock.release()
+
+    def deactivate(self):
         """Detaches an output channel from the effect"""
         self.pixels = None
         self._active = False
-        self.lock.release()
         _LOGGER.info(f"Effect {self.NAME} deactivated.")
 
     def update_config(self, config):
